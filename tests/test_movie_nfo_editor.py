@@ -7,6 +7,7 @@ from app.movie_nfo_editor import (
     actor_sortorder_for_display,
     build_backdrop_png_names,
     build_poster_png_name,
+    build_matching_video_filename,
     build_javdb_url,
     build_movie_name,
     clean_name,
@@ -48,6 +49,12 @@ class MovieNFOEditorHelperTests(unittest.TestCase):
                 "SQTE-515 (2024)-backdrop2.png",
                 "SQTE-515 (2024)-backdrop3.png",
             ],
+        )
+
+    def test_build_matching_video_filename_keeps_video_extension(self):
+        self.assertEqual(
+            build_matching_video_filename(r"D:\Videos\clip.mkv", "SQTE-515 (2024).nfo"),
+            "SQTE-515 (2024).mkv",
         )
 
     def test_parse_multiline_links_ignores_blank_lines(self):

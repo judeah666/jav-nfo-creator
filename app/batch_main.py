@@ -1,4 +1,4 @@
-from app.combined_app import run
+from app.batch_actor_editor import run
 
 
 if __name__ == "__main__":

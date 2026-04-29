@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 import traceback
@@ -10,7 +11,7 @@ import json
 from io import BytesIO
 from threading import Thread
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
@@ -20,6 +21,8 @@ SUPPORTED_TAGS = ("[Uncen-Leaked]", "[English-Sub]", "[UNCENSORED]", "[4K]")
 DEFAULT_JAVDB_URL_TEMPLATE = "https://www.javdatabase.com/movies/{title}/"
 DEFAULT_COUNTRY = "Japanese"
 ACTOR_XML_FIELDS = ("name", "role", "type", "sortorder", "thumb")
+REMOTE_IMAGE_MAX_BYTES = 12 * 1024 * 1024
+REMOTE_IMAGE_SCHEMES = {"http", "https"}
 MOVIE_XML_ORDER = (
     ("Title", "title"),
     ("OriginalTitle", "originaltitle"),
@@ -112,12 +115,52 @@ def build_backdrop_png_names(filename, count):
     return [f"{stem}-backdrop{i}.png" for i in range(1, count + 1)]
 
 
+def build_matching_video_filename(video_path, nfo_filename):
+    stem, _ext = os.path.splitext((nfo_filename or "").strip())
+    if not stem:
+        stem = "MOVIE"
+    _video_stem, video_ext = os.path.splitext(os.path.basename(video_path or ""))
+    return f"{stem}{video_ext}"
+
+
 def parse_multiline_links(text):
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
 
 def parse_genre_values(text):
     return [part.strip() for part in (text or "").split(",") if part.strip()]
+
+
+def is_allowed_remote_image_url(url):
+    parsed = urlparse((url or "").strip())
+    return parsed.scheme.lower() in REMOTE_IMAGE_SCHEMES and bool(parsed.netloc)
+
+
+def fetch_remote_image_bytes(url, user_agent="JAVNFOCreator/1.0", timeout=4, max_bytes=REMOTE_IMAGE_MAX_BYTES):
+    if not is_allowed_remote_image_url(url):
+        return None
+
+    try:
+        request = Request(url, headers={"User-Agent": user_agent})
+        with urlopen(request, timeout=timeout) as response:
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                return None
+
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        return None
+                except ValueError:
+                    pass
+
+            image_bytes = response.read(max_bytes + 1)
+            if len(image_bytes) > max_bytes:
+                return None
+            return image_bytes
+    except Exception:
+        return None
 
 
 def format_loaded_genres(root):
@@ -129,11 +172,11 @@ def format_loaded_genres(root):
 
 
 def tag_settings_path():
-    return os.path.join(get_app_base_dir(), "JAVNFOCreator-tags.json")
+    return os.path.join(get_app_data_dir(), "JAVNFOCreator-tags.json")
 
 
 def website_settings_path():
-    return os.path.join(get_app_base_dir(), "JAVNFOCreator-websites.json")
+    return os.path.join(get_app_data_dir(), "JAVNFOCreator-websites.json")
 
 def get_tag_lookup(tags=None):
     active_tags = tuple(tags or SUPPORTED_TAGS)
@@ -222,17 +265,20 @@ def contains_supported_tag(text, tag, tags=None):
 
 
 def get_error_log_path():
-    if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.getcwd()
-    return os.path.join(base_dir, "JAVNFOCreator-error.log")
+    return os.path.join(get_app_data_dir(), "JAVNFOCreator-error.log")
 
 
 def get_app_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_app_data_dir():
+    appdata_root = os.environ.get("APPDATA") or os.path.expanduser("~")
+    target_dir = os.path.join(appdata_root, "JAVNFOCreator")
+    os.makedirs(target_dir, exist_ok=True)
+    return target_dir
 
 
 def log_exception(exc_type, exc_value, exc_traceback):
@@ -293,9 +339,10 @@ class MovieNFOEditor:
         if self.configure_window:
             self.root.title("JAV NFO Creator")
             self.root.geometry("1260x780")
-            self.root.minsize(1040, 660)
+        self.root.minsize(1040, 660)
 
         self.current_file = None
+        self.current_video_file = None
         self.selected_actor_index = None
         self.actor_entries = {}
         self.actor_editor_var = tk.StringVar(value="Ready to add a new actor")
@@ -308,6 +355,11 @@ class MovieNFOEditor:
         self.actor_preview_cache = {}
         self.poster_preview_request_url = None
         self.poster_preview_image = None
+        self.poster_preview_loading_url = None
+        self.poster_preview_rendered_url = None
+        self.poster_preview_rendered_size = None
+        self.poster_preview_last_canvas_width = None
+        self.collapsible_sections = {}
         self.actor_mousewheel_targets = []
         self.form_mousewheel_targets = []
         self.poster_mousewheel_targets = []
@@ -328,27 +380,28 @@ class MovieNFOEditor:
             style.theme_use("clam")
 
         self.colors = {
-            "page_bg": "#eef3f8",
-            "shell_bg": "#f6f9fc",
+            "page_bg": "#f8f9fa",
+            "shell_bg": "#f8f9fa",
             "surface": "#ffffff",
-            "surface_alt": "#f8fbff",
-            "surface_soft": "#fbfdff",
-            "border": "#d8e2ee",
-            "border_soft": "#e6edf5",
-            "border_strong": "#c4d3e4",
-            "text": "#162033",
-            "muted": "#66758c",
-            "subtle": "#8b98ac",
-            "accent": "#2f6fed",
-            "accent_soft": "#e8f0ff",
-            "accent_hover": "#275fcb",
-            "selected": "#eff5ff",
-            "success": "#1f8f5f",
-            "success_soft": "#e8f7ef",
-            "warning": "#b7791f",
-            "warning_soft": "#fff6e5",
-            "danger": "#c94b45",
-            "danger_soft": "#fdeeed",
+            "surface_alt": "#f8f9fa",
+            "surface_soft": "#f8f9fa",
+            "border": "#dee2e6",
+            "border_soft": "#e9ecef",
+            "border_strong": "#ced4da",
+            "text": "#212529",
+            "muted": "#6c757d",
+            "subtle": "#868e96",
+            "accent": "#0d6efd",
+            "accent_soft": "#e7f1ff",
+            "accent_hover": "#0b5ed7",
+            "selected": "#e7f1ff",
+            "success": "#198754",
+            "success_soft": "#eaf7f0",
+            "warning": "#fd7e14",
+            "warning_soft": "#fff1e6",
+            "danger": "#dc3545",
+            "danger_soft": "#fbeaec",
+            "header_bg": "#f8f9fa",
         }
 
         self.root.configure(bg=self.colors["page_bg"])
@@ -376,25 +429,25 @@ class MovieNFOEditor:
         )
         style.configure(
             "SectionTitle.TLabel",
-            background=self.colors["surface"],
+            background=self.colors["header_bg"],
             foreground=self.colors["text"],
-            font=("Segoe UI Semibold", 11),
+            font=("Segoe UI Semibold", 10),
         )
         style.configure(
             "SectionMeta.TLabel",
-            background=self.colors["surface"],
+            background=self.colors["header_bg"],
             foreground=self.colors["subtle"],
             font=("Segoe UI", 9),
         )
         style.configure(
             "Section.TLabel",
             background=self.colors["surface"],
-            foreground=self.colors["text"],
+            foreground=self.colors["muted"],
             font=("Segoe UI Semibold", 9),
         )
         style.configure(
             "App.TButton",
-            padding=(14, 9),
+            padding=(12, 8),
             font=("Segoe UI Semibold", 9),
             background=self.colors["surface"],
             foreground=self.colors["text"],
@@ -410,7 +463,7 @@ class MovieNFOEditor:
         )
         style.configure(
             "Primary.TButton",
-            padding=(14, 9),
+            padding=(12, 8),
             font=("Segoe UI Semibold", 9),
             background=self.colors["accent"],
             foreground="#ffffff",
@@ -479,14 +532,14 @@ class MovieNFOEditor:
 
         style.configure(
             "Vertical.TScrollbar",
-            background="#d6e0ec",
-            troughcolor="#f3f7fb",
-            bordercolor="#f3f7fb",
-            arrowcolor="#5f7088",
+            background="#ced4da",
+            troughcolor="#f8f9fa",
+            bordercolor="#f8f9fa",
+            arrowcolor="#6c757d",
             relief="flat",
             width=12,
         )
-        style.map("Vertical.TScrollbar", background=[("active", "#c7d4e5")])
+        style.map("Vertical.TScrollbar", background=[("active", "#adb5bd")])
 
     def create_ui(self):
         self.host.columnconfigure(0, weight=1)
@@ -699,7 +752,7 @@ class MovieNFOEditor:
         tab_bar.grid(row=0, column=0, sticky="ew")
         tab_bar.grid_columnconfigure(0, weight=1)
 
-        tab_strip = tk.Frame(tab_bar, bg="#e9eff6", padx=4, pady=3)
+        tab_strip = tk.Frame(tab_bar, bg=self.colors["surface_alt"], padx=4, pady=3)
         tab_strip.grid(row=0, column=0, sticky="w")
 
         self.editor_tab_buttons["movie"] = tk.Label(
@@ -718,7 +771,7 @@ class MovieNFOEditor:
         self.editor_tab_buttons["poster"] = tk.Label(
             tab_strip,
             text="Poster",
-            bg="#e9eff6",
+            bg=self.colors["surface_alt"],
             fg=self.colors["muted"],
             padx=16,
             pady=6,
@@ -783,7 +836,7 @@ class MovieNFOEditor:
         self.bind_form_mousewheel_target(self.form_canvas)
         self.bind_form_mousewheel_target(form_content)
 
-        basic_card, basic = self.create_card_section(form_content, " Basic Info ", 0)
+        basic_card, basic = self.create_card_section(form_content, "Basic Info", 0)
         basic.columnconfigure(0, weight=3)
         basic.columnconfigure(1, weight=1)
 
@@ -803,7 +856,7 @@ class MovieNFOEditor:
         self.tag_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(0, 2))
         self.tag_combo.bind("<Button-1>", lambda event: self.tag_combo.event_generate("<Down>"))
 
-        details_card, details = self.create_card_section(form_content, " Details ", 1)
+        details_card, details = self.create_card_section(form_content, "Details", 1)
         details.columnconfigure(0, weight=1)
         details.columnconfigure(1, weight=1)
         details.columnconfigure(2, weight=1)
@@ -897,10 +950,7 @@ class MovieNFOEditor:
         self.poster_content_window = self.poster_canvas.create_window((0, 0), window=poster_content, anchor="nw")
         poster_content.columnconfigure(0, weight=1)
 
-        self.poster_canvas.bind(
-            "<Configure>",
-            lambda event: self.poster_canvas.itemconfigure(self.poster_content_window, width=event.width),
-        )
+        self.poster_canvas.bind("<Configure>", self.handle_poster_canvas_configure)
         poster_content.bind(
             "<Configure>",
             lambda _event: (
@@ -911,12 +961,12 @@ class MovieNFOEditor:
         self.bind_poster_mousewheel_target(self.poster_canvas)
         self.bind_poster_mousewheel_target(poster_content)
 
-        poster_card, poster = self.create_card_section(poster_content, " Poster ", 0, pady=(0, 8))
+        poster_card, poster = self.create_card_section(poster_content, "Poster", 0, pady=(0, 8))
         poster.columnconfigure(0, weight=1)
-        poster.rowconfigure(1, weight=1)
+        poster.columnconfigure(1, weight=0)
+        poster.rowconfigure(2, weight=1)
         self.poster_link_entry = ttk.Entry(poster, textvariable=self.poster_link_var, style="App.TEntry")
         self.poster_link_entry.grid(row=0, column=0, sticky="ew", pady=3)
-        self.poster_link_entry.bind("<FocusOut>", lambda _event: self.update_poster_preview())
         self.bind_poster_mousewheel_target(self.poster_link_entry)
 
         preview_frame = tk.Frame(
@@ -925,11 +975,9 @@ class MovieNFOEditor:
             padx=10,
             pady=10,
         )
-        preview_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        preview_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         preview_frame.columnconfigure(0, weight=1)
         self.poster_preview_frame = preview_frame
-        self.poster_preview_frame.bind("<Configure>", lambda _event: self.schedule_poster_preview_update())
-
         self.poster_preview_label = tk.Label(
             preview_frame,
             bg=self.colors["surface_soft"],
@@ -948,7 +996,7 @@ class MovieNFOEditor:
         )
         self.poster_preview_status.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
-        backdrops_card, backdrops = self.create_card_section(poster_content, " Backdrops ", 1, pady=(0, 0))
+        backdrops_card, backdrops = self.create_card_section(poster_content, "Backdrops", 1, pady=(0, 0), collapsed=True)
         backdrops.columnconfigure(0, weight=1)
         backdrops.rowconfigure(0, weight=1)
 
@@ -1025,6 +1073,7 @@ class MovieNFOEditor:
         header = tk.Frame(outer, bg=self.colors["surface"])
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
         ttk.Label(header, text="Actors", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
 
         editor_card = ttk.Frame(outer, style="Card.TFrame")
@@ -1487,13 +1536,7 @@ class MovieNFOEditor:
         Thread(target=worker, daemon=True).start()
 
     def fetch_actor_thumb(self, url):
-        try:
-            request = Request(url, headers={"User-Agent": "MovieNFOEditor/1.0"})
-            with urlopen(request, timeout=4) as response:
-                raw_bytes = response.read()
-            return raw_bytes
-        except Exception:
-            return None
+        return fetch_remote_image_bytes(url)
 
     def prepare_actor_image(self, image_bytes, size):
         try:
@@ -1519,6 +1562,8 @@ class MovieNFOEditor:
         self.poster_preview_label.configure(image="", text="")
         self.poster_preview_label.image = None
         self.poster_preview_image = None
+        self.poster_preview_rendered_url = None
+        self.poster_preview_rendered_size = None
         self.poster_preview_status.configure(text=message)
 
     def show_poster_preview_image(self, prepared_image, message="Poster ready."):
@@ -1536,6 +1581,37 @@ class MovieNFOEditor:
         if hasattr(self, "_poster_preview_after_id") and self._poster_preview_after_id:
             self.root.after_cancel(self._poster_preview_after_id)
         self._poster_preview_after_id = self.root.after(250, self.update_poster_preview)
+
+    def handle_poster_canvas_configure(self, event):
+        self.poster_canvas.itemconfigure(self.poster_content_window, width=event.width)
+        if self.poster_preview_last_canvas_width == event.width:
+            return
+        self.poster_preview_last_canvas_width = event.width
+        self.handle_poster_preview_resize()
+
+    def handle_poster_preview_resize(self, _event=None):
+        poster_url = self.poster_link_var.get().strip()
+        if not poster_url:
+            return
+
+        preview_size = self.get_poster_preview_size()
+        if (
+            poster_url == self.poster_preview_rendered_url
+            and self.poster_preview_rendered_size == preview_size
+        ):
+            return
+
+        cached_bytes = self.actor_preview_cache.get(poster_url)
+        if not cached_bytes:
+            return
+
+        prepared = self.prepare_poster_image(cached_bytes, preview_size)
+        if prepared is None:
+            return
+
+        self.poster_preview_rendered_url = poster_url
+        self.poster_preview_rendered_size = preview_size
+        self.show_poster_preview_image(prepared)
 
     def finish_actor_thumb_image(self, url, image_bytes):
         listeners = self.actor_thumb_requests.pop(url, [])
@@ -1645,16 +1721,36 @@ class MovieNFOEditor:
 
         if not poster_url:
             self.clear_poster_preview("Paste a poster link to preview it here.")
+            self.poster_preview_loading_url = None
+            return
+
+        if not is_allowed_remote_image_url(poster_url):
+            self.clear_poster_preview("Only http and https image links are allowed.")
+            self.poster_preview_loading_url = None
             return
 
         cached_bytes = self.actor_preview_cache.get(poster_url)
         if cached_bytes:
+            if (
+                poster_url == self.poster_preview_rendered_url
+                and self.poster_preview_rendered_size == preview_size
+                and self.poster_preview_image is not None
+            ):
+                self.poster_preview_status.configure(text="Poster ready.")
+                return
             prepared = self.prepare_poster_image(cached_bytes, preview_size)
             if prepared is not None:
+                self.poster_preview_rendered_url = poster_url
+                self.poster_preview_rendered_size = preview_size
                 self.show_poster_preview_image(prepared)
                 return
             self.actor_preview_cache.pop(poster_url, None)
 
+        if self.poster_preview_loading_url == poster_url:
+            if self.poster_preview_image is None:
+                self.poster_preview_status.configure(text="Loading poster preview...")
+            return
+        self.poster_preview_loading_url = poster_url
         self.clear_poster_preview("Loading poster preview...")
 
         def worker():
@@ -1664,13 +1760,14 @@ class MovieNFOEditor:
         Thread(target=worker, daemon=True).start()
 
     def finish_poster_preview(self, poster_url, image_bytes):
+        self.poster_preview_loading_url = None
         if poster_url != self.poster_preview_request_url:
             return
         preview_size = self.get_poster_preview_size()
 
         if image_bytes is None:
             self.actor_preview_cache.pop(poster_url, None)
-            self.clear_poster_preview("Could not load poster preview.")
+            self.clear_poster_preview("Could not load a valid image preview.")
             return
 
         prepared = self.prepare_poster_image(image_bytes, preview_size)
@@ -1679,53 +1776,210 @@ class MovieNFOEditor:
             self.clear_poster_preview("Poster link did not return a valid image.")
             return
         self.actor_preview_cache[poster_url] = image_bytes
+        self.poster_preview_rendered_url = poster_url
+        self.poster_preview_rendered_size = preview_size
         self.show_poster_preview_image(prepared)
 
     def save_poster_png(self):
-        poster_url = self.poster_link_var.get().strip()
-        backdrop_links = parse_multiline_links(self.poster_text_fields["BackdropLinks"].get("1.0", tk.END))
-        if not poster_url and not backdrop_links:
+        pending_downloads = self.collect_png_targets(os.path.dirname(self.current_file) if self.current_file else "")
+        if pending_downloads is None:
+            return
+        if not pending_downloads:
             messagebox.showerror("Missing Images", "Enter a Poster Link or one or more Backdrop Links first.")
             return
-
-        base_filename = self.build_filename()
         if self.current_file:
             target_dir = os.path.dirname(self.current_file)
         else:
             target_dir = filedialog.askdirectory(title="Choose folder for poster and backdrop PNGs")
             if not target_dir:
                 return
-
-        pending_downloads = []
-        if poster_url:
-            pending_downloads.append((poster_url, build_poster_png_name(base_filename)))
-        for link, filename in zip(backdrop_links, build_backdrop_png_names(base_filename, len(backdrop_links))):
-            pending_downloads.append((link, filename))
-
-        saved_paths = []
-        for image_url, filename in pending_downloads:
-            image_bytes = self.actor_preview_cache.get(image_url)
-            if image_bytes is None:
-                image_bytes = self.fetch_actor_thumb(image_url)
-                if image_bytes is None:
-                    messagebox.showerror("Download Failed", f"Could not download image from:\n{image_url}")
-                    return
-
-            path = os.path.join(target_dir, filename)
-            try:
-                self.save_image_bytes_as_png(image_bytes, path)
-                self.actor_preview_cache[image_url] = image_bytes
-            except Exception as exc:
-                self.actor_preview_cache.pop(image_url, None)
-                messagebox.showerror("Save Failed", f"Could not save a valid PNG:\n{path}\n\n{exc}")
+            pending_downloads = self.collect_png_targets(target_dir)
+            if pending_downloads is None or not pending_downloads:
                 return
-            saved_paths.append(path)
+
+        existing_paths = []
+        for _image_url, path in pending_downloads:
+            if os.path.exists(path):
+                existing_paths.append(path)
+        if existing_paths and not self.confirm_overwrite_paths(existing_paths, title="Overwrite PNG Files?"):
+            self.set_status("Save Images cancelled", "warning")
+            return
+
+        saved_paths = self.save_png_downloads(pending_downloads)
+        if saved_paths is None:
+            return
 
         if not saved_paths:
             return
 
-        self.set_status(f"Saved {len(saved_paths)} PNG file(s) to {target_dir}", "success")
-        messagebox.showinfo("Saved", "Saved PNG files:\n" + "\n".join(saved_paths))
+        self.set_status(f"Saved {len(saved_paths)} image file(s) to {target_dir}", "success")
+        self.show_saved_png_dialog(saved_paths, target_dir)
+
+    def show_saved_png_dialog(self, saved_paths, target_dir):
+        poster_paths = []
+        backdrop_paths = []
+        other_paths = []
+        for path in saved_paths:
+            name = os.path.basename(path).lower()
+            if "-poster" in name:
+                poster_paths.append(path)
+            elif "-backdrop" in name:
+                backdrop_paths.append(path)
+            else:
+                other_paths.append(path)
+
+        sections = []
+        if poster_paths:
+            sections.append(("Poster", poster_paths))
+        if backdrop_paths:
+            sections.append(("Backdrops", backdrop_paths))
+        if other_paths:
+            sections.append(("Other Files", other_paths))
+
+        self.show_result_paths_dialog(
+            title="Images Saved",
+            hero_title="Image export completed",
+            hero_body=f"{len(saved_paths)} file(s) saved to {target_dir}",
+            sections=sections,
+            copy_label="Copy Paths",
+            status_message=f"Copied {len(saved_paths)} saved image path(s)",
+        )
+
+    def confirm_overwrite_path(self, path, title="Overwrite File?"):
+        return messagebox.askyesno(
+            title,
+            f"This file already exists:\n{path}\n\nDo you want to overwrite it?",
+        )
+
+    def confirm_overwrite_paths(self, paths, title="Overwrite Files?"):
+        unique_paths = []
+        seen = set()
+        for path in paths:
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_paths.append(path)
+
+        if not unique_paths:
+            return True
+        if len(unique_paths) == 1:
+            return self.confirm_overwrite_path(unique_paths[0], title=title)
+
+        preview_paths = unique_paths[:5]
+        preview_text = "\n".join(preview_paths)
+        remaining_count = len(unique_paths) - len(preview_paths)
+        if remaining_count > 0:
+            preview_text += f"\n... and {remaining_count} more"
+
+        return messagebox.askyesno(
+            title,
+            f"{len(unique_paths)} files already exist and will be overwritten:\n\n{preview_text}\n\nDo you want to continue?",
+        )
+
+    def confirm_use_existing_folder(self, path):
+        return messagebox.askyesno(
+            "Folder Already Exists",
+            f"This folder already exists:\n{path}\n\nDo you want to use this existing folder?",
+        )
+
+    def show_result_paths_dialog(self, title, hero_title, hero_body, sections, copy_label="Copy Paths", status_message="Paths copied"):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("700x420")
+        win.minsize(560, 320)
+
+        outer = tk.Frame(win, bg=self.colors["page_bg"], padx=14, pady=14)
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=1)
+
+        hero = tk.Frame(
+            outer,
+            bg=self.colors["success_soft"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border_soft"],
+            padx=14,
+            pady=12,
+        )
+        hero.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        hero.grid_columnconfigure(0, weight=1)
+
+        tk.Label(
+            hero,
+            text=hero_title,
+            bg=self.colors["success_soft"],
+            fg=self.colors["success"],
+            font=("Segoe UI Semibold", 12),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        tk.Label(
+            hero,
+            text=hero_body,
+            bg=self.colors["success_soft"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=640,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        list_shell = tk.Frame(
+            outer,
+            bg=self.colors["border_soft"],
+            padx=1,
+            pady=1,
+            highlightthickness=0,
+            bd=0,
+        )
+        list_shell.grid(row=1, column=0, sticky="nsew")
+        list_shell.grid_columnconfigure(0, weight=1)
+        list_shell.grid_rowconfigure(0, weight=1)
+
+        list_body = tk.Frame(list_shell, bg=self.colors["surface"])
+        list_body.grid(row=0, column=0, sticky="nsew")
+        list_body.grid_columnconfigure(0, weight=1)
+        list_body.grid_rowconfigure(0, weight=1)
+
+        list_text = tk.Text(
+            list_body,
+            font=("Consolas", 9),
+            bg=self.colors["surface"],
+            fg=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            wrap="none",
+            padx=10,
+            pady=10,
+        )
+        list_text.grid(row=0, column=0, sticky="nsew")
+        for section_title, paths in sections:
+            list_text.insert(tk.END, f"{section_title}\n")
+            for path in paths:
+                list_text.insert(tk.END, f"  {path}\n")
+            list_text.insert(tk.END, "\n")
+        list_text.configure(state="disabled")
+
+        scrollbar = ttk.Scrollbar(list_body, orient="vertical", command=list_text.yview, style="Vertical.TScrollbar")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        list_text.configure(yscrollcommand=scrollbar.set)
+
+        button_row = tk.Frame(outer, bg=self.colors["page_bg"])
+        button_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+
+        def copy_all_paths():
+            combined = "\n".join(path for _section_title, paths in sections for path in paths)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(combined)
+            self.root.update()
+            self.set_status(status_message, "success")
+
+        ttk.Button(button_row, text=copy_label, style="App.TButton", command=copy_all_paths).pack(side="left")
+        ttk.Button(button_row, text="Close", style="Primary.TButton", command=win.destroy).pack(side="right")
 
     def build_actor_values(self, item=None):
         name = self.actor_entries["Name"].get().strip()
@@ -1787,9 +2041,8 @@ class MovieNFOEditor:
         file_group.pack(side="left")
         ttk.Button(file_group, text="Load", style="App.TButton", command=self.load_nfo_dialog).pack(side="left", padx=(0, 5))
         ttk.Button(file_group, text="Save", style="App.TButton", command=self.save_nfo).pack(side="left", padx=5)
-        ttk.Button(file_group, text="Save to PNG", style="App.TButton", command=self.save_poster_png).pack(side="left", padx=5)
         ttk.Button(file_group, text="Save As", style="App.TButton", command=self.save_as_nfo).pack(side="left", padx=5)
-        ttk.Button(file_group, text="Create Folder", style="App.TButton", command=self.create_folder).pack(side="left", padx=(5, 0))
+        ttk.Button(file_group, text="Create Movie", style="Primary.TButton", command=self.create_movie).pack(side="left", padx=(8, 0))
 
         ttk.Separator(frame, orient="vertical").pack(side="left", fill="y", padx=10)
 
@@ -1805,6 +2058,9 @@ class MovieNFOEditor:
         file_menu.add_command(label="Load", command=self.load_nfo_dialog)
         file_menu.add_command(label="Save", command=self.save_nfo)
         file_menu.add_command(label="Save As", command=self.save_as_nfo)
+        file_menu.add_command(label="Create Folder", command=self.create_folder)
+        file_menu.add_command(label="Save Images", command=self.save_poster_png)
+        file_menu.add_command(label="Create Movie", command=self.create_movie)
         menubar.add_cascade(label="File", menu=file_menu)
 
         settings_menu = tk.Menu(menubar, tearoff=0)
@@ -1886,7 +2142,24 @@ class MovieNFOEditor:
         self.status_label.grid(row=0, column=1, sticky="ew")
         self.set_status("No file loaded", "neutral")
 
-    def create_card_section(self, parent, title, row, sticky="ew", pady=(0, 6)):
+    def toggle_section(self, section_key):
+        section = self.collapsible_sections.get(section_key)
+        if not section:
+            return
+        collapsed = not section["collapsed"]
+        section["collapsed"] = collapsed
+        if collapsed:
+            section["body"].grid_remove()
+            section["button"].configure(text="+")
+        else:
+            section["body"].grid()
+            section["button"].configure(text="-")
+        if hasattr(self, "form_canvas"):
+            self.form_canvas.configure(scrollregion=self.form_canvas.bbox("all"))
+        if hasattr(self, "poster_canvas"):
+            self.poster_canvas.configure(scrollregion=self.poster_canvas.bbox("all"))
+
+    def create_card_section(self, parent, title, row, sticky="ew", pady=(0, 6), collapsed=False):
         card = tk.Frame(
             parent,
             bg=self.colors["border_soft"],
@@ -1900,21 +2173,48 @@ class MovieNFOEditor:
             card.grid_rowconfigure(0, weight=1)
         card.grid_columnconfigure(0, weight=1)
 
-        shell = tk.Frame(card, bg=self.colors["surface"], padx=12, pady=10)
+        shell = tk.Frame(card, bg=self.colors["surface"], padx=0, pady=0)
         shell.grid(row=0, column=0, sticky=sticky)
         shell.grid_columnconfigure(0, weight=1)
         if "n" in sticky or "s" in sticky:
             shell.grid_rowconfigure(1, weight=1)
 
-        header = tk.Frame(shell, bg=self.colors["surface"])
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header = tk.Frame(shell, bg=self.colors["header_bg"], padx=12, pady=10)
+        header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
 
         clean_title = title.strip()
         ttk.Label(header, text=clean_title, style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+        toggle_button = tk.Button(
+            header,
+            text="+" if collapsed else "-",
+            command=lambda key=clean_title: self.toggle_section(key),
+            bg=self.colors["header_bg"],
+            fg=self.colors["muted"],
+            activebackground=self.colors["surface_alt"],
+            activeforeground=self.colors["text"],
+            relief="flat",
+            bd=0,
+            padx=6,
+            pady=0,
+            font=("Segoe UI Semibold", 12),
+            cursor="hand2",
+        )
+        toggle_button.grid(row=0, column=1, sticky="e")
 
-        section = ttk.Frame(shell, style="Card.TFrame")
-        section.grid(row=1, column=0, sticky=sticky)
+        body = tk.Frame(shell, bg=self.colors["surface"], padx=12, pady=10)
+        body.grid(row=1, column=0, sticky=sticky)
+        section = ttk.Frame(body, style="Card.TFrame")
+        section.grid(row=0, column=0, sticky=sticky)
+        body.grid_columnconfigure(0, weight=1)
+        self.collapsible_sections[clean_title] = {
+            "body": body,
+            "button": toggle_button,
+            "collapsed": collapsed,
+        }
+        if collapsed:
+            body.grid_remove()
         return card, section
 
     def set_status(self, message, tone="neutral"):
@@ -2289,6 +2589,10 @@ class MovieNFOEditor:
             self.save_as_nfo()
             return
 
+        if os.path.exists(self.current_file) and not self.confirm_overwrite_path(self.current_file):
+            self.set_status("Save cancelled", "warning")
+            return
+
         try:
             write_xml_file(self.build_xml(), self.current_file)
         except OSError as exc:
@@ -2310,6 +2614,10 @@ class MovieNFOEditor:
         if not path:
             return
 
+        if os.path.exists(path) and not self.confirm_overwrite_path(path):
+            self.set_status("Save As cancelled", "warning")
+            return
+
         try:
             write_xml_file(self.build_xml(), path)
         except OSError as exc:
@@ -2317,12 +2625,237 @@ class MovieNFOEditor:
             return
 
         self.set_current_file(path)
-        messagebox.showinfo("Saved", f"Saved:\n{path}")
         self.set_status(f"Saved: {path}", "success")
+        self.show_result_paths_dialog(
+            title="File Saved",
+            hero_title="NFO file saved",
+            hero_body=f"Metadata file saved successfully to {os.path.dirname(path)}",
+            sections=[("Saved File", [path])],
+            copy_label="Copy Path",
+            status_message="Copied saved file path",
+        )
 
     def build_filename(self):
         year_value = extract_year(self.get_field_value("Premiered"))
         return f"{build_movie_name(self.get_field_value('Title'), year_value, self.tag_var.get())}.nfo"
+
+    def build_movie_folder_name(self):
+        return build_movie_name(
+            self.get_field_value("Title"),
+            extract_year(self.get_field_value("Premiered")),
+            self.tag_var.get(),
+            self.get_field_value("OriginalTitle"),
+        )
+
+    def validate_title_and_year(self, action_label):
+        title = self.get_field_value("Title").strip()
+        year = extract_year(self.get_field_value("Premiered"))
+        if not title or not year:
+            messagebox.showerror("Missing Information", f"Title and Year are required before {action_label}.")
+            return None
+        return title, year
+
+    def choose_movie_file_path(self, title="Choose movie file"):
+        dialog_kwargs = {
+            "title": title,
+            "filetypes": [
+                ("Video Files", "*.mp4 *.mkv *.avi *.wmv *.mov *.m4v *.ts *.m2ts *.webm"),
+                ("All Files", "*.*"),
+            ],
+        }
+        if self.current_video_file and os.path.exists(self.current_video_file):
+            dialog_kwargs["initialdir"] = os.path.dirname(self.current_video_file)
+        elif self.current_file:
+            dialog_kwargs["initialdir"] = os.path.dirname(self.current_file)
+        return filedialog.askopenfilename(**dialog_kwargs)
+
+    def collect_png_targets(self, target_dir):
+        poster_url = self.poster_link_var.get().strip()
+        backdrop_links = parse_multiline_links(self.poster_text_fields["BackdropLinks"].get("1.0", tk.END))
+        if not poster_url and not backdrop_links:
+            return []
+
+        invalid_links = [url for url in [poster_url, *backdrop_links] if url and not is_allowed_remote_image_url(url)]
+        if invalid_links:
+            messagebox.showerror("Invalid Image Link", "Only http and https image links are allowed.")
+            return None
+
+        base_filename = self.build_filename()
+        pending_downloads = []
+        if poster_url:
+            pending_downloads.append((poster_url, os.path.join(target_dir, build_poster_png_name(base_filename))))
+        for link, filename in zip(backdrop_links, build_backdrop_png_names(base_filename, len(backdrop_links))):
+            pending_downloads.append((link, os.path.join(target_dir, filename)))
+        return pending_downloads
+
+    def save_png_downloads(self, pending_downloads):
+        saved_paths = []
+        for image_url, path in pending_downloads:
+            image_bytes = self.actor_preview_cache.get(image_url)
+            if image_bytes is None:
+                image_bytes = self.fetch_actor_thumb(image_url)
+                if image_bytes is None:
+                    messagebox.showerror("Download Failed", f"Could not download a valid image from:\n{image_url}")
+                    return None
+
+            try:
+                self.save_image_bytes_as_png(image_bytes, path)
+                self.actor_preview_cache[image_url] = image_bytes
+            except Exception as exc:
+                self.actor_preview_cache.pop(image_url, None)
+                messagebox.showerror("Save Failed", f"Could not save a valid PNG:\n{path}\n\n{exc}")
+                return None
+            saved_paths.append(path)
+        return saved_paths
+
+    def load_video_file(self):
+        if not self.validate_title_and_year("choosing a movie file"):
+            return
+
+        source_path = self.choose_movie_file_path(title="Choose video file to rename")
+        if not source_path:
+            return
+
+        target_name = build_matching_video_filename(source_path, self.build_filename())
+        target_path = os.path.join(os.path.dirname(source_path), target_name)
+
+        if os.path.normcase(source_path) == os.path.normcase(target_path):
+            self.set_status(f"Video already matches filename: {target_name}", "neutral")
+            self.show_result_paths_dialog(
+                title="Video Already Matches",
+                hero_title="Video already renamed",
+                hero_body="The selected video file already matches the current NFO filename.",
+                sections=[("Video File", [target_path])],
+                copy_label="Copy Path",
+                status_message="Copied video file path",
+            )
+            self.current_video_file = target_path
+            return
+
+        if os.path.exists(target_path):
+            messagebox.showerror(
+                "Rename Video Failed",
+                f"A file with the target name already exists:\n{target_path}",
+            )
+            return
+
+        if os.path.exists(target_path) and not self.confirm_overwrite_path(target_path, title="Overwrite Movie File?"):
+            self.set_status("Movie rename cancelled", "warning")
+            return
+
+        try:
+            os.replace(source_path, target_path)
+        except OSError as exc:
+            messagebox.showerror(
+                "Rename Video Failed",
+                f"Could not rename video file:\n{source_path}\n\nTarget:\n{target_path}\n\n{exc}",
+            )
+            return
+
+        self.current_video_file = target_path
+        self.set_status(f"Video renamed: {target_path}", "success")
+        self.show_result_paths_dialog(
+            title="Video Renamed",
+            hero_title="Video file renamed",
+            hero_body=f"Video renamed to match the current NFO filename in {os.path.dirname(target_path)}",
+            sections=[("Renamed Video", [target_path])],
+            copy_label="Copy Path",
+            status_message="Copied renamed video path",
+        )
+
+    def create_movie(self):
+        if not self.validate_title_and_year("creating a movie"):
+            return
+
+        base = filedialog.askdirectory(title="Choose base folder for the movie")
+        if not base:
+            return
+
+        folder_path = os.path.join(base, self.build_movie_folder_name())
+        if os.path.isdir(folder_path):
+            if not self.confirm_use_existing_folder(folder_path):
+                self.set_status("Create Movie cancelled", "warning")
+                return
+
+        video_source = self.current_video_file if self.current_video_file and os.path.exists(self.current_video_file) else None
+        if not video_source:
+            video_source = self.choose_movie_file_path(title="Choose movie file to move into the movie folder (optional)")
+
+        nfo_path = os.path.join(folder_path, self.build_filename())
+        video_target = None
+        if video_source:
+            video_target = os.path.join(folder_path, build_matching_video_filename(video_source, self.build_filename()))
+        png_targets = self.collect_png_targets(folder_path)
+        if png_targets is None:
+            return
+
+        existing_paths = []
+        if os.path.exists(nfo_path):
+            existing_paths.append(nfo_path)
+        for _image_url, path in png_targets:
+            if os.path.exists(path):
+                existing_paths.append(path)
+        if video_source and video_target and os.path.exists(video_target) and os.path.normcase(os.path.abspath(video_source)) != os.path.normcase(os.path.abspath(video_target)):
+            existing_paths.append(video_target)
+
+        if existing_paths and not self.confirm_overwrite_paths(existing_paths, title="Overwrite Movie Files?"):
+            self.set_status("Create Movie cancelled", "warning")
+            return
+
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+            write_xml_file(self.build_xml(), nfo_path)
+        except OSError as exc:
+            messagebox.showerror("Create Movie Failed", f"Could not create movie folder or save NFO:\n{folder_path}\n\n{exc}")
+            return
+
+        saved_pngs = self.save_png_downloads(png_targets)
+        if saved_pngs is None:
+            return
+
+        if video_source and video_target:
+            try:
+                if os.path.normcase(os.path.abspath(video_source)) != os.path.normcase(os.path.abspath(video_target)):
+                    if os.path.exists(video_target):
+                        os.remove(video_target)
+                    shutil.move(video_source, video_target)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Create Movie Failed",
+                    f"Could not move movie file:\n{video_source}\n\nTarget:\n{video_target}\n\n{exc}",
+                )
+                return
+            self.current_video_file = video_target
+
+        self.set_current_file(nfo_path)
+        self.set_status(f"Movie package created: {folder_path}", "success")
+
+        sections = [("Created Folder", [folder_path]), ("Saved NFO", [nfo_path])]
+        if video_target:
+            sections.append(("Movie File", [video_target]))
+        if saved_pngs:
+            poster_paths = [path for path in saved_pngs if "-poster" in os.path.basename(path).lower()]
+            backdrop_paths = [path for path in saved_pngs if "-backdrop" in os.path.basename(path).lower()]
+            other_paths = [path for path in saved_pngs if path not in poster_paths and path not in backdrop_paths]
+            if poster_paths:
+                sections.append(("Poster", poster_paths))
+            if backdrop_paths:
+                sections.append(("Backdrops", backdrop_paths))
+            if other_paths:
+                sections.append(("Other Files", other_paths))
+
+        self.show_result_paths_dialog(
+            title="Movie Created",
+            hero_title="Movie package created",
+            hero_body=(
+                f"Folder, NFO, images, and movie file saved successfully in {folder_path}"
+                if video_target
+                else f"Folder, NFO, and images saved successfully in {folder_path}"
+            ),
+            sections=sections,
+            copy_label="Copy Paths",
+            status_message="Copied created movie paths",
+        )
 
     def create_folder(self):
         title = self.get_field_value("Title")
@@ -2343,14 +2876,25 @@ class MovieNFOEditor:
             return
 
         path = os.path.join(base, name)
+        if os.path.isdir(path):
+            if not self.confirm_use_existing_folder(path):
+                self.set_status("Create Folder cancelled", "warning")
+                return
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("Create Folder Failed", f"Could not create folder:\n{path}\n\n{exc}")
             return
 
-        messagebox.showinfo("Success", f"Folder created:\n{path}")
         self.set_status(f"Folder created: {path}", "success")
+        self.show_result_paths_dialog(
+            title="Folder Created",
+            hero_title="Folder created",
+            hero_body=f"Movie folder created successfully in {base}",
+            sections=[("Created Folder", [path])],
+            copy_label="Copy Folder Path",
+            status_message="Copied created folder path",
+        )
 
     def clear_info(self):
         for key in self.entries:
