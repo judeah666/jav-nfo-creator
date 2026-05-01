@@ -7,6 +7,7 @@ from app.movie_nfo_editor import (
     actor_sortorder_for_display,
     build_backdrop_png_names,
     build_poster_png_name,
+    build_part_filename,
     build_matching_video_filename,
     build_javdb_url,
     build_movie_name,
@@ -15,6 +16,7 @@ from app.movie_nfo_editor import (
     detect_supported_tag,
     format_actor_list_row,
     format_loaded_genres,
+    is_allowed_remote_image_url,
     normalize_supported_tag,
     parse_genre_values,
     parse_multiline_links,
@@ -57,11 +59,34 @@ class MovieNFOEditorHelperTests(unittest.TestCase):
             "SQTE-515 (2024).mkv",
         )
 
+    def test_build_part_filename_inserts_part_suffix_before_extension(self):
+        self.assertEqual(
+            build_part_filename("SQTE-515 (2024).nfo", 2),
+            "SQTE-515 (2024)-Part-2.nfo",
+        )
+
+    def test_build_matching_video_filename_uses_parted_nfo_name(self):
+        self.assertEqual(
+            build_matching_video_filename(r"D:\Videos\clip.mkv", build_part_filename("SQTE-515 (2024).nfo", 3)),
+            "SQTE-515 (2024)-Part-3.mkv",
+        )
+
     def test_parse_multiline_links_ignores_blank_lines(self):
         self.assertEqual(
             parse_multiline_links("https://one.webp\n\n  https://two.webp  \n"),
             ["https://one.webp", "https://two.webp"],
         )
+
+    def test_is_allowed_remote_image_url_accepts_standard_public_https_url(self):
+        self.assertTrue(is_allowed_remote_image_url("https://www.javdatabase.com/poster.webp"))
+
+    def test_is_allowed_remote_image_url_rejects_localhost_and_private_hosts(self):
+        self.assertFalse(is_allowed_remote_image_url("http://localhost/poster.webp"))
+        self.assertFalse(is_allowed_remote_image_url("http://127.0.0.1/poster.webp"))
+        self.assertFalse(is_allowed_remote_image_url("http://192.168.1.5/poster.webp"))
+
+    def test_is_allowed_remote_image_url_rejects_non_standard_ports(self):
+        self.assertFalse(is_allowed_remote_image_url("https://example.com:8443/poster.webp"))
 
     def test_parse_genre_values_splits_comma_separated_values(self):
         self.assertEqual(parse_genre_values("JAV, Action,  Drama "), ["JAV", "Action", "Drama"])

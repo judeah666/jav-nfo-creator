@@ -627,7 +627,7 @@ class BatchActorEditor:
 
         media = tk.Frame(body, bg=self.colors["surface"])
         media.grid(row=0, column=0, sticky="nsw")
-        thumb_label = tk.Label(media, bg=self.colors["surface"], bd=0)
+        thumb_label = tk.Label(media, bg=self.colors["surface"], bd=0, cursor="hand2")
         thumb_label.thumb_size = (82, 110)
         thumb_label.grid(row=0, column=0, sticky="nsew")
 
@@ -689,6 +689,8 @@ class BatchActorEditor:
             "name": name_label,
             "role": role_label,
             "thumb_text": thumb_text_label,
+            "thumb_name": "",
+            "thumb_url": "",
         }
 
     def get_actor_placeholder_image(self, name, size=(92, 124)):
@@ -785,6 +787,8 @@ class BatchActorEditor:
         card_view["name"].configure(text=display_name)
         card_view["role"].configure(text=display_role)
         card_view["thumb_text"].configure(text=display_thumb)
+        card_view["thumb_name"] = display_name
+        card_view["thumb_url"] = thumb_url or ""
 
         placeholder = self.get_actor_placeholder_image(display_name, size=card_view["thumb"].thumb_size)
         card_view["thumb"].configure(image=placeholder)
@@ -800,6 +804,8 @@ class BatchActorEditor:
         card_view["name"].configure(text="No actor selected")
         card_view["role"].configure(text="Choose an actor name from the scanned files.")
         card_view["thumb_text"].configure(text="No thumb")
+        card_view["thumb_name"] = ""
+        card_view["thumb_url"] = ""
 
     def update_summary(self):
         record, actor = self.find_preview_actor()

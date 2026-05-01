@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import shutil
 import sys
@@ -23,6 +24,7 @@ DEFAULT_COUNTRY = "Japanese"
 ACTOR_XML_FIELDS = ("name", "role", "type", "sortorder", "thumb")
 REMOTE_IMAGE_MAX_BYTES = 12 * 1024 * 1024
 REMOTE_IMAGE_SCHEMES = {"http", "https"}
+REMOTE_IMAGE_ALLOWED_PORTS = {None, 80, 443}
 MOVIE_XML_ORDER = (
     ("Title", "title"),
     ("OriginalTitle", "originaltitle"),
@@ -123,6 +125,14 @@ def build_matching_video_filename(video_path, nfo_filename):
     return f"{stem}{video_ext}"
 
 
+def build_part_filename(filename, part_number):
+    stem, ext = os.path.splitext((filename or "").strip())
+    if not stem:
+        stem = "MOVIE"
+    safe_part_number = max(1, int(part_number))
+    return f"{stem}-Part-{safe_part_number}{ext}"
+
+
 def parse_multiline_links(text):
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
@@ -133,7 +143,32 @@ def parse_genre_values(text):
 
 def is_allowed_remote_image_url(url):
     parsed = urlparse((url or "").strip())
-    return parsed.scheme.lower() in REMOTE_IMAGE_SCHEMES and bool(parsed.netloc)
+    if parsed.scheme.lower() not in REMOTE_IMAGE_SCHEMES or not parsed.netloc:
+        return False
+    if parsed.username or parsed.password:
+        return False
+
+    hostname = (parsed.hostname or "").strip().casefold()
+    if not hostname or hostname == "localhost":
+        return False
+    if parsed.port not in REMOTE_IMAGE_ALLOWED_PORTS:
+        return False
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+
+    return not any(
+        (
+            address.is_private,
+            address.is_loopback,
+            address.is_link_local,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+        )
+    )
 
 
 def fetch_remote_image_bytes(url, user_agent="JAVNFOCreator/1.0", timeout=4, max_bytes=REMOTE_IMAGE_MAX_BYTES):
@@ -1146,7 +1181,6 @@ class MovieNFOEditor:
         table_frame.rowconfigure(1, weight=1)
 
         ttk.Label(table_frame, text="Actor List", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
-
         list_frame = ttk.Frame(table_frame, style="Card.TFrame")
         list_frame.grid(row=1, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
@@ -1447,13 +1481,10 @@ class MovieNFOEditor:
         thumb_label.image = placeholder
         if thumb_url:
             self.set_actor_thumb_image(thumb_label, thumb_url, name)
-
-        bind_targets = [card, body, media, content, sort_label, name_label, role_label]
+        bind_targets = [card, body, media, content, sort_label, name_label, role_label, thumb_label]
         for widget in bind_targets:
             widget.bind("<Button-1>", lambda _event, actor_index=index: self.select_actor(actor_index))
             self.bind_actor_mousewheel_target(widget)
-        thumb_label.bind("<Button-1>", lambda _event, actor_index=index: self.open_actor_image_preview(actor_index))
-        self.bind_actor_mousewheel_target(thumb_label)
         return {
             "card": card,
             "body": body,
@@ -1634,84 +1665,6 @@ class MovieNFOEditor:
             image = photo or self.get_actor_placeholder_image(name, size=thumb_size)
             label.configure(image=image)
             label.image = image
-
-    def open_actor_image_preview(self, index):
-        self.select_actor(index)
-        name, role, _actor_type, sortorder, thumb_url = self.actor_data[index]
-
-        win = tk.Toplevel(self.root)
-        win.title(f"Actor Preview - {name or 'Actor'}")
-        win.transient(self.root)
-        win.geometry("380x500")
-        win.minsize(340, 420)
-
-        frame = ttk.Frame(win, padding=14, style="App.TFrame")
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        ttk.Label(frame, text=name or "Unnamed Actor", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text=f"SortOrder #{sortorder}   {role or 'No role'}", style="App.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(4, 10)
-        )
-
-        image_holder = tk.Label(frame, bg="#ffffff", bd=0)
-        image_holder.grid(row=2, column=0, sticky="nsew")
-        status_label = ttk.Label(frame, text="", style="App.TLabel")
-        status_label.grid(row=3, column=0, sticky="w", pady=(10, 0))
-
-        placeholder = self.get_actor_placeholder_image(name, size=(300, 390))
-        image_holder.configure(image=placeholder)
-        image_holder.image = placeholder
-
-        if not thumb_url:
-            status_label.configure(text="No thumb link available for this actor.")
-            return
-
-        cached_bytes = self.actor_preview_cache.get(thumb_url)
-        if cached_bytes:
-            prepared = self.prepare_actor_image(cached_bytes, (300, 390))
-            if prepared is not None:
-                preview_image = ImageTk.PhotoImage(prepared)
-                image_holder.configure(image=preview_image)
-                image_holder.image = preview_image
-                status_label.configure(text="Loaded preview from cached thumb image.")
-                return
-
-        status_label.configure(text="Loading preview image...")
-
-        def worker():
-            image_bytes = self.fetch_actor_thumb(thumb_url)
-            self.root.after(
-                0,
-                lambda: self.finish_actor_preview_image(win, image_holder, status_label, thumb_url, name, image_bytes),
-            )
-
-        Thread(target=worker, daemon=True).start()
-
-    def finish_actor_preview_image(self, win, image_holder, status_label, thumb_url, name, image_bytes):
-        if not win.winfo_exists():
-            return
-
-        if image_bytes is None:
-            placeholder = self.get_actor_placeholder_image(name, size=(300, 390))
-            image_holder.configure(image=placeholder)
-            image_holder.image = placeholder
-            status_label.configure(text="Could not load thumb preview.")
-            return
-
-        self.actor_preview_cache[thumb_url] = image_bytes
-        prepared = self.prepare_actor_image(image_bytes, (300, 390))
-        if prepared is None:
-            placeholder = self.get_actor_placeholder_image(name, size=(300, 390))
-            image_holder.configure(image=placeholder)
-            image_holder.image = placeholder
-            status_label.configure(text="Thumb link did not return a valid image.")
-            return
-        preview_image = ImageTk.PhotoImage(prepared)
-        image_holder.configure(image=preview_image)
-        image_holder.image = preview_image
-        status_label.configure(text="Preview loaded.")
 
     def update_poster_preview(self):
         self._poster_preview_after_id = None
@@ -2669,7 +2622,21 @@ class MovieNFOEditor:
             dialog_kwargs["initialdir"] = os.path.dirname(self.current_file)
         return filedialog.askopenfilename(**dialog_kwargs)
 
-    def collect_png_targets(self, target_dir):
+    def choose_movie_file_paths(self, title="Choose movie files"):
+        dialog_kwargs = {
+            "title": title,
+            "filetypes": [
+                ("Video Files", "*.mp4 *.mkv *.avi *.wmv *.mov *.m4v *.ts *.m2ts *.webm"),
+                ("All Files", "*.*"),
+            ],
+        }
+        if self.current_video_file and os.path.exists(self.current_video_file):
+            dialog_kwargs["initialdir"] = os.path.dirname(self.current_video_file)
+        elif self.current_file:
+            dialog_kwargs["initialdir"] = os.path.dirname(self.current_file)
+        return list(filedialog.askopenfilenames(**dialog_kwargs))
+
+    def collect_png_targets(self, target_dir, base_filename=None):
         poster_url = self.poster_link_var.get().strip()
         backdrop_links = parse_multiline_links(self.poster_text_fields["BackdropLinks"].get("1.0", tk.END))
         if not poster_url and not backdrop_links:
@@ -2680,7 +2647,7 @@ class MovieNFOEditor:
             messagebox.showerror("Invalid Image Link", "Only http and https image links are allowed.")
             return None
 
-        base_filename = self.build_filename()
+        base_filename = base_filename or self.build_filename()
         pending_downloads = []
         if poster_url:
             pending_downloads.append((poster_url, os.path.join(target_dir, build_poster_png_name(base_filename))))
@@ -2777,26 +2744,67 @@ class MovieNFOEditor:
                 self.set_status("Create Movie cancelled", "warning")
                 return
 
-        video_source = self.current_video_file if self.current_video_file and os.path.exists(self.current_video_file) else None
-        if not video_source:
-            video_source = self.choose_movie_file_path(title="Choose movie file to move into the movie folder (optional)")
+        video_sources = self.choose_movie_file_paths(title="Choose movie file(s) to move into the movie folder (optional)")
+        base_nfo_filename = self.build_filename()
+        file_plans = []
 
-        nfo_path = os.path.join(folder_path, self.build_filename())
-        video_target = None
-        if video_source:
-            video_target = os.path.join(folder_path, build_matching_video_filename(video_source, self.build_filename()))
-        png_targets = self.collect_png_targets(folder_path)
-        if png_targets is None:
-            return
+        if video_sources:
+            for index, video_source in enumerate(video_sources, start=1):
+                nfo_filename = base_nfo_filename
+                if len(video_sources) > 1:
+                    nfo_filename = build_part_filename(base_nfo_filename, index)
+                include_metadata = len(video_sources) == 1 or index == 1
+                nfo_path = os.path.join(folder_path, nfo_filename) if include_metadata else None
+                video_target = os.path.join(folder_path, build_matching_video_filename(video_source, nfo_filename))
+                png_targets = []
+                if include_metadata:
+                    png_targets = self.collect_png_targets(folder_path, base_filename=nfo_filename)
+                    if png_targets is None:
+                        return
+                file_plans.append(
+                    {
+                        "index": index,
+                        "include_metadata": include_metadata,
+                        "video_source": video_source,
+                        "nfo_filename": nfo_filename,
+                        "nfo_path": nfo_path,
+                        "video_target": video_target,
+                        "png_targets": png_targets,
+                    }
+                )
+        else:
+            nfo_path = os.path.join(folder_path, base_nfo_filename)
+            png_targets = self.collect_png_targets(folder_path, base_filename=base_nfo_filename)
+            if png_targets is None:
+                return
+            file_plans.append(
+                {
+                    "index": 1,
+                    "include_metadata": True,
+                    "video_source": "",
+                    "nfo_filename": base_nfo_filename,
+                    "nfo_path": nfo_path,
+                    "video_target": None,
+                    "png_targets": png_targets,
+                }
+            )
 
         existing_paths = []
-        if os.path.exists(nfo_path):
-            existing_paths.append(nfo_path)
-        for _image_url, path in png_targets:
-            if os.path.exists(path):
-                existing_paths.append(path)
-        if video_source and video_target and os.path.exists(video_target) and os.path.normcase(os.path.abspath(video_source)) != os.path.normcase(os.path.abspath(video_target)):
-            existing_paths.append(video_target)
+        for plan in file_plans:
+            if plan["nfo_path"] and os.path.exists(plan["nfo_path"]):
+                existing_paths.append(plan["nfo_path"])
+            for _image_url, path in plan["png_targets"]:
+                if os.path.exists(path):
+                    existing_paths.append(path)
+            video_source = plan["video_source"]
+            video_target = plan["video_target"]
+            if (
+                video_source
+                and video_target
+                and os.path.exists(video_target)
+                and os.path.normcase(os.path.abspath(video_source)) != os.path.normcase(os.path.abspath(video_target))
+            ):
+                existing_paths.append(video_target)
 
         if existing_paths and not self.confirm_overwrite_paths(existing_paths, title="Overwrite Movie Files?"):
             self.set_status("Create Movie cancelled", "warning")
@@ -2804,16 +2812,27 @@ class MovieNFOEditor:
 
         try:
             os.makedirs(folder_path, exist_ok=True)
-            write_xml_file(self.build_xml(), nfo_path)
+            movie_xml = self.build_xml()
+            for plan in file_plans:
+                if plan["nfo_path"]:
+                    write_xml_file(movie_xml, plan["nfo_path"])
         except OSError as exc:
             messagebox.showerror("Create Movie Failed", f"Could not create movie folder or save NFO:\n{folder_path}\n\n{exc}")
             return
 
-        saved_pngs = self.save_png_downloads(png_targets)
-        if saved_pngs is None:
-            return
+        saved_pngs = []
+        for plan in file_plans:
+            plan_saved_pngs = self.save_png_downloads(plan["png_targets"])
+            if plan_saved_pngs is None:
+                return
+            saved_pngs.extend(plan_saved_pngs)
 
-        if video_source and video_target:
+        saved_video_targets = []
+        for plan in file_plans:
+            video_source = plan["video_source"]
+            video_target = plan["video_target"]
+            if not video_source or not video_target:
+                continue
             try:
                 if os.path.normcase(os.path.abspath(video_source)) != os.path.normcase(os.path.abspath(video_target)):
                     if os.path.exists(video_target):
@@ -2825,14 +2844,19 @@ class MovieNFOEditor:
                     f"Could not move movie file:\n{video_source}\n\nTarget:\n{video_target}\n\n{exc}",
                 )
                 return
-            self.current_video_file = video_target
+            saved_video_targets.append(video_target)
 
-        self.set_current_file(nfo_path)
+        self.current_video_file = saved_video_targets[0] if saved_video_targets else None
+        metadata_plan = next((plan for plan in file_plans if plan["nfo_path"]), None)
+        self.set_current_file(metadata_plan["nfo_path"] if metadata_plan else None)
         self.set_status(f"Movie package created: {folder_path}", "success")
 
-        sections = [("Created Folder", [folder_path]), ("Saved NFO", [nfo_path])]
-        if video_target:
-            sections.append(("Movie File", [video_target]))
+        saved_nfo_paths = [plan["nfo_path"] for plan in file_plans if plan["nfo_path"]]
+        sections = [("Created Folder", [folder_path])]
+        if saved_nfo_paths:
+            sections.append(("Saved NFO", saved_nfo_paths))
+        if saved_video_targets:
+            sections.append(("Movie Files", saved_video_targets))
         if saved_pngs:
             poster_paths = [path for path in saved_pngs if "-poster" in os.path.basename(path).lower()]
             backdrop_paths = [path for path in saved_pngs if "-backdrop" in os.path.basename(path).lower()]
@@ -2848,8 +2872,8 @@ class MovieNFOEditor:
             title="Movie Created",
             hero_title="Movie package created",
             hero_body=(
-                f"Folder, NFO, images, and movie file saved successfully in {folder_path}"
-                if video_target
+                f"Folder, NFO, images, and movie files saved successfully in {folder_path}"
+                if saved_video_targets
                 else f"Folder, NFO, and images saved successfully in {folder_path}"
             ),
             sections=sections,
@@ -2908,6 +2932,7 @@ class MovieNFOEditor:
         self.tag_var.set("")
         self.poster_link_var.set("")
         self.clear_poster_field_value("BackdropLinks")
+        self.current_video_file = None
         self.set_current_file(None)
         self.set_status("Movie info cleared", "warning")
         self.update_name_preview()
@@ -2922,6 +2947,7 @@ class MovieNFOEditor:
         self.tag_var.set("")
         self.poster_link_var.set("")
         self.clear_poster_field_value("BackdropLinks")
+        self.current_video_file = None
 
         self.actor_data = []
         self.refresh_actor_list()
